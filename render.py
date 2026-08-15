@@ -18,9 +18,7 @@ OUTPUT_PATH = "docs/index.html"
 
 
 def fetch_prices():
-    """Fetch raw hourly market data from aWattar. Returns list of dicts:
-    [{"start_ms": ..., "end_ms": ..., "price_eur_mwh": ...}, ...]
-    """
+    """Fetch raw hourly market data from aWattar."""
     req = urllib.request.Request(AWATTAR_URL, headers={"User-Agent": "vienna-display/1.0"})
     with urllib.request.urlopen(req, timeout=20) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
@@ -37,7 +35,7 @@ def build_today_series(raw):
     now = datetime.now(VIENNA_TZ)
     today = now.date()
 
-   hours = []
+    hours = []
     for entry in raw:
         start = to_local(entry["start_timestamp"])
         if start.date() == today:
@@ -119,61 +117,3 @@ def render_html(hours, now):
     font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
   }}
   .wrap {{
-    box-sizing: border-box;
-    width: 100vw; height: 100vh;
-    padding: 5vw;
-    display: flex; flex-direction: column; justify-content: center;
-  }}
-  .row {{ display: flex; justify-content: space-between; align-items: baseline; }}
-  .top {{ border-bottom: 2px solid #111; padding-bottom: 10px; margin-bottom: 18px; font-size: 4vw; }}
-  .price {{ font-size: 12vw; font-weight: 600; line-height: 1; }}
-  .unit {{ font-size: 4vw; font-weight: 400; }}
-  .tag {{
-    border: 2px solid #111; padding: 4px 18px; font-size: 4vw; font-weight: 600;
-    text-transform: uppercase; margin-left: 24px;
-  }}
-  .tag.low {{ background: #111; color: #fff; }}
-  .chart {{ margin-top: 24px; }}
-  .bottom {{ border-top: 2px solid #111; padding-top: 10px; margin-top: 18px; font-size: 3vw; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="row top">
-    <span>Vienna &middot; {now.strftime('%a %d %b')} &middot; {now.strftime('%H:%M')}</span>
-    <span>updates every 15 min</span>
-  </div>
-  <div class="row">
-    <div>
-      <div class="price">{current['price']:.1f}<span class="unit"> ct/kWh</span></div>
-    </div>
-    <div class="tag {tier}">{tier}</div>
-  </div>
-  <div class="chart">{chart}</div>
-  <div class="row bottom">
-    <span>cheapest left today: <strong>{cheapest_str}</strong></span>
-    <span>range today: {min(prices):.1f}&ndash;{max(prices):.1f} ct</span>
-  </div>
-</div>
-</body>
-</html>
-"""
-    return html
-
-
-def main():
-    raw = fetch_prices()
-    hours, now = build_today_series(raw)
-    if not hours:
-        raise RuntimeError("No price data found for today from aWattar.")
-    html = render_html(hours, now)
-
-    import os
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        f.write(html)
-    print(f"Wrote {OUTPUT_PATH} with {len(hours)} hourly prices, current hour {now.hour}:00")
-
-
-if __name__ == "__main__":
-    main()
