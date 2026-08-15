@@ -39,7 +39,7 @@ def build_today_series(raw):
 
     hours = []
     for entry in raw:
-    start = to_local(entry["start_timestamp"])
+start = to_local(entry["start_timestamp"])
         if start.date() == today:
             ct_per_kwh = entry["marketprice"] / 10.0  # EUR/MWh -> ct/kWh
             hours.append({"hour": start.hour, "price": ct_per_kwh})
