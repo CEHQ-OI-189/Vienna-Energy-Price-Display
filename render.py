@@ -28,8 +28,8 @@ OUTPUT_PATH = "docs/index.html"
 # Wien Energie's OPTIMA Aktiv price is NOT fixed - it's recalculated monthly
 # against a price index (FM 22). Check your Wien Energie account/bill for the
 # current month's ct/kWh rate and update BOTH values below whenever it changes.
-OPTIMA_AKTIV_CT_PER_KWH = 18.7289
-OPTIMA_AKTIV_MONTH = "August 2026"
+OPTIMA_AKTIV_CT_PER_KWH = 22.8547
+OPTIMA_AKTIV_MONTH = "September 2026"
 
 
 def fetch_range(start_dt, end_dt):
