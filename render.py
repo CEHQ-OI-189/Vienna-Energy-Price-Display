@@ -28,8 +28,8 @@ OUTPUT_PATH = "docs/index.html"
 # Wien Energie's OPTIMA Aktiv price is NOT fixed - it's recalculated monthly
 # against a price index (FM 22). Check your Wien Energie account/bill for the
 # current month's ct/kWh rate and update BOTH values below whenever it changes.
-OPTIMA_AKTIV_CT_PER_KWH = 22.8547
-OPTIMA_AKTIV_MONTH = "September 2026"
+OPTIMA_AKTIV_CT_PER_KWH = 18.7289
+OPTIMA_AKTIV_MONTH = "August 2026"
 
 
 def fetch_range(start_dt, end_dt):
@@ -70,9 +70,7 @@ def classify(price, all_prices):
     return "medium"
 
 
-def render_svg_bars(hours, reference_price=None, reference_label=""):
-    """Renders the chart with NO hour pre-highlighted (that's now done live,
-    client-side, via data-hour attributes the page's JS reads)."""
+def render_svg_bars(hours, current_hour, reference_price=None, reference_label=""):
     prices = [h["price"] for h in hours]
     pmin, pmax = min(prices), max(prices)
     pad = (pmax - pmin) * 0.1 or 1
@@ -100,11 +98,10 @@ def render_svg_bars(hours, reference_price=None, reference_label=""):
         x = left_margin + i * (bar_w + gap)
         bar_h = max(2, chart_h - y_of(h["price"]))
         y = chart_h - bar_h
-        # No fill hardcoded here except a default gray - JS sets the "current
-        # hour" bar to black on load/each minute based on the real clock.
+        fill = "#111111" if h["hour"] == current_hour else "#c9c9c9"
         bars_svg.append(
             f'<rect data-hour="{h["hour"]}" x="{x}" y="{y}" width="{bar_w}" '
-            f'height="{bar_h}" fill="#c9c9c9"></rect>'
+            f'height="{bar_h}" fill="{fill}"></rect>'
         )
 
     baseline = f'<line x1="{left_margin}" y1="{chart_h}" x2="{plot_right}" y2="{chart_h}" stroke="#111" stroke-width="2"></line>'
@@ -133,22 +130,33 @@ def render_svg_bars(hours, reference_price=None, reference_label=""):
             x = left_margin + i * (bar_w + gap)
             labels += f'<text x="{x + 2}" y="{chart_h + 16}" font-size="9" fill="#555">{h["hour"]:02d}h</text>'
 
+    day_divider = ""
+    for i in range(1, len(hours)):
+        if hours[i]["start"].date() != hours[i - 1]["start"].date():
+            x_div = left_margin + i * (bar_w + gap) - gap / 2
+            day_divider = (
+                f'<line x1="{x_div}" y1="0" x2="{x_div}" y2="{chart_h}" '
+                f'stroke="#999" stroke-width="1" stroke-dasharray="2,2"></line>'
+            )
+            break
+
     return (
         f'<svg viewBox="0 0 {width} {chart_h + 24}" preserveAspectRatio="xMidYMid meet" '
-        f'role="img" aria-label="Hourly price bar chart for today, current hour highlighted live, '
-        f'with Y-axis, OPTIMA Aktiv reference line and day min/max">'
-        + "".join(bars_svg) + baseline + axis_line + reference_line + minmax_labels + labels + "</svg>"
+        f'role="img" aria-label="Hourly price bar chart, current hour highlighted live, '
+        f'with Y-axis, OPTIMA Aktiv reference line and visible min/max">'
+        + "".join(bars_svg) + baseline + axis_line + reference_line + day_divider + minmax_labels + labels + "</svg>"
     )
 
 
-def render_html(today_hours, week_hours, now, diagnostics):
-    prices = [h["price"] for h in today_hours]
-    today_avg = sum(prices) / len(prices)
+def render_html(chart_hours, today_hours, week_hours, now, diagnostics):
+    chart_prices = [h["price"] for h in chart_hours]
+    tiers = {h["hour"]: classify(h["price"], chart_prices) for h in chart_hours}
 
-    tiers = {h["hour"]: classify(h["price"], prices) for h in today_hours}
+    day_prices = [h["price"] for h in today_hours]
+    today_avg = sum(day_prices) / len(day_prices)
 
     chart = render_svg_bars(
-        today_hours,
+        chart_hours, now.hour,
         reference_price=OPTIMA_AKTIV_CT_PER_KWH,
         reference_label="OPTIMA Aktiv",
     )
@@ -166,16 +174,12 @@ def render_html(today_hours, week_hours, now, diagnostics):
             f"7-Day Rolling Avg. = {week_avg:.1f} ct/kWh "
             f"({sign}{abs(pct):.1f}%)"
         )
-        diagnostics.append(f"today_avg (full precision) = {today_avg:.4f}")
-        diagnostics.append(f"week_avg  (full precision) = {week_avg:.4f}")
-        diagnostics.append(f"pct diff  (full precision) = {pct:.4f}%")
     else:
         avg_line = f"Today's Avg. = {today_avg:.1f} ct/kWh"
 
-    # Data for the client-side "which hour is current" script.
     hours_json = json.dumps([
         {"hour": h["hour"], "price": round(h["price"], 2), "tier": tiers[h["hour"]]}
-        for h in today_hours
+        for h in chart_hours
     ])
 
     css = (
@@ -268,37 +272,53 @@ def render_html(today_hours, week_hours, now, diagnostics):
 def main():
     now = datetime.now(VIENNA_TZ)
     midnight_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    midnight_tomorrow = midnight_today + timedelta(days=1)
+    midnight_yesterday = midnight_today - timedelta(days=1)
+    midnight_day_after_tomorrow = midnight_today + timedelta(days=2)
     midnight_7d_ago = midnight_today - timedelta(days=7)
+    current_hour_dt = now.replace(minute=0, second=0, microsecond=0)
 
     diagnostics = [f"script run at (Vienna time) = {now.isoformat()}"]
 
-    diagnostics.append(f"today fetch requested: {midnight_today.isoformat()} to {midnight_tomorrow.isoformat()}")
-    today_raw = fetch_range(midnight_today, midnight_tomorrow)
-    today_hours_all = to_hours(today_raw)
-    if today_hours_all:
+    # Wide fetch: yesterday through day-after-tomorrow. This comfortably
+    # covers any possible rolling window (13h back / 10h forward from any
+    # current hour never needs more than 1 day of slack either direction).
+    # aWattar simply won't have tomorrow's data yet before ~14:00 - that's
+    # fine, we just get fewer entries and the window is narrower until then.
+    diagnostics.append(
+        f"wide fetch requested: {midnight_yesterday.isoformat()} to {midnight_day_after_tomorrow.isoformat()}"
+    )
+    wide_raw = fetch_range(midnight_yesterday, midnight_day_after_tomorrow)
+    all_hours = to_hours(wide_raw)
+    if all_hours:
         diagnostics.append(
-            f"today fetch received {len(today_hours_all)} entries, "
-            f"first={today_hours_all[0]['start'].isoformat()}, "
-            f"last={today_hours_all[-1]['start'].isoformat()}"
+            f"wide fetch received {len(all_hours)} entries, "
+            f"first={all_hours[0]['start'].isoformat()}, last={all_hours[-1]['start'].isoformat()}"
         )
-    today_hours = [h for h in today_hours_all if h["start"].date() == now.date()]
-    diagnostics.append(f"today_hours after date-filter: {len(today_hours)} entries")
+
+    # The rolling chart window: 14 hours before the current hour, the
+    # current hour itself, and 9 hours after = 24 slots when fully available.
+    # This split keeps a full hour of buffer past aWattar's ~14:00-14:10
+    # publish time before the window first needs tomorrow's data (at 15:00).
+    window_start = current_hour_dt - timedelta(hours=14)
+    window_end = current_hour_dt + timedelta(hours=9)
+    chart_hours = [h for h in all_hours if window_start <= h["start"] <= window_end]
+    diagnostics.append(
+        f"chart window: {window_start.isoformat()} to {window_end.isoformat()} "
+        f"-> {len(chart_hours)} bars"
+    )
+
+    # Today's Avg / 7-Day Rolling Avg stay anchored to the calendar day,
+    # independent of whatever's currently scrolled into the chart.
+    today_hours = [h for h in all_hours if h["start"].date() == now.date()]
 
     diagnostics.append(f"week fetch requested: {midnight_7d_ago.isoformat()} to {midnight_today.isoformat()}")
     week_raw = fetch_range(midnight_7d_ago, midnight_today)
     week_hours = to_hours(week_raw)
-    if week_hours:
-        diagnostics.append(
-            f"week fetch received {len(week_hours)} entries, "
-            f"first={week_hours[0]['start'].isoformat()}, "
-            f"last={week_hours[-1]['start'].isoformat()}"
-        )
 
-    if not today_hours:
-        raise RuntimeError("No price data found for today from aWattar.")
+    if not chart_hours or not today_hours:
+        raise RuntimeError("No price data found from aWattar for the chart window or today.")
 
-    html = render_html(today_hours, week_hours, now, diagnostics)
+    html = render_html(chart_hours, today_hours, week_hours, now, diagnostics)
 
     import os
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
