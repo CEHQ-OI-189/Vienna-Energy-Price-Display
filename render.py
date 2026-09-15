@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
 Fetches Vienna (Austria) EPEX Spot hourly electricity prices from the free
-aWattar API and renders a single self-contained HTML page: a bar chart of
-today's prices, current price with a low/medium/high tag, a comparison
-against the OPTIMA Aktiv fixed rate, and today's average vs. the trailing
-7-day average.
+aWattar API and renders a single self-contained HTML page showing the full,
+bill-accurate OPTIMA Voll Aktiv gross price (not the raw wholesale price) -
+directly comparable to the OPTIMA Aktiv reference line.
 
-Since aWattar publishes the whole day's prices in advance, the page embeds
-the full day as JSON and a small client-side script picks the "current"
-hour using the viewer's own clock (fixed to Europe/Vienna regardless of
-device timezone) - so the display stays correct hour to hour even if this
-script doesn't get re-run by GitHub Actions exactly on schedule.
+Robustness design: the server embeds a WIDE buffer of hourly data (~3 days:
+yesterday through day-after-tomorrow, whatever's actually published). The
+browser itself - not the server - decides which 24-hour slice to show,
+recomputing it from the real device clock every 60 seconds. This means even
+if the GitHub Action that regenerates this page misses several scheduled
+runs in a row, the displayed window stays correctly positioned, just drawn
+from a slightly older (but still valid) buffer, rather than silently going
+stale/misaligned like a server-side-only window would.
 
-No API key needed. Designed to be run on a schedule (e.g. GitHub Actions)
-and its output (docs/index.html) published as a static site.
+No API key needed. Designed to run on a schedule (e.g. GitHub Actions) and
+its output (docs/index.html) published as a static site.
 """
 
 import json
@@ -24,12 +26,41 @@ VIENNA_TZ = timezone(timedelta(hours=2))  # CEST; close enough for display purpo
 AWATTAR_URL = "https://api.awattar.at/v1/marketdata"
 OUTPUT_PATH = "docs/index.html"
 
-# --- UPDATE THIS MANUALLY ---
+# --- UPDATE THIS MANUALLY, MONTHLY ---
 # Wien Energie's OPTIMA Aktiv price is NOT fixed - it's recalculated monthly
 # against a price index (FM 22). Check your Wien Energie account/bill for the
-# current month's ct/kWh rate and update BOTH values below whenever it changes.
-OPTIMA_AKTIV_CT_PER_KWH = 18.7289
-OPTIMA_AKTIV_MONTH = "August 2026"
+# current month's ct/kWh rate (the gross, all-in figure they show you) and
+# update BOTH values below whenever it changes.
+OPTIMA_AKTIV_CT_PER_KWH = 22.8547
+OPTIMA_AKTIV_MONTH = "September 2026"
+
+# --- OPTIMA Voll Aktiv gross price formula ---
+# Verified against Wien Energie's own published Preisblätter:
+#   net = (EPEX ct/kWh x 1.07) + 1.42 ct - 0.20 ct (Basismix discount)
+#   gross = net x 1.07 (7% Gebrauchsabgabe, Vienna network customers)
+#                x 1.20 (20% USt/VAT)
+# Both OPTIMA Aktiv and OPTIMA Voll Aktiv go through this same net->gross
+# tax/duty conversion, so applying it here makes the chart directly,
+# honestly comparable to the OPTIMA_AKTIV_CT_PER_KWH figure above.
+VOLL_AKTIV_PCT_MARKUP = 1.07
+VOLL_AKTIV_FIXED_SURCHARGE_CT = 1.42
+BASISMIX_DISCOUNT_CT = 0.20
+GEBRAUCHSABGABE_MULT = 1.07
+UST_MULT = 1.20
+
+# Rolling chart window: 14 hours before the current hour, the current hour
+# itself, and 9 hours after = 24 slots when fully available. This split
+# keeps a full hour of buffer past aWattar's ~14:00-14:10 publish time
+# before the window first needs tomorrow's data (at 15:00).
+WINDOW_HOURS_PAST = 14
+WINDOW_HOURS_FUTURE = 9
+
+
+def epex_eur_mwh_to_gross_ct(epex_eur_mwh):
+    epex_ct = epex_eur_mwh / 10.0
+    net = (epex_ct * VOLL_AKTIV_PCT_MARKUP) + VOLL_AKTIV_FIXED_SURCHARGE_CT - BASISMIX_DISCOUNT_CT
+    gross = net * GEBRAUCHSABGABE_MULT * UST_MULT
+    return gross
 
 
 def fetch_range(start_dt, end_dt):
@@ -48,12 +79,18 @@ def to_local(ms):
 
 
 def to_hours(raw):
-    """Convert raw aWattar entries into a list of {start (datetime), hour, price (ct/kWh)}."""
+    """Convert raw aWattar entries into a list of
+    {start (datetime), ts_ms (int), hour, price (gross ct/kWh)}."""
     out = []
     for entry in raw:
         start = to_local(entry["start_timestamp"])
-        ct_per_kwh = entry["marketprice"] / 10.0  # EUR/MWh -> ct/kWh
-        out.append({"start": start, "hour": start.hour, "price": ct_per_kwh})
+        price = epex_eur_mwh_to_gross_ct(entry["marketprice"])
+        out.append({
+            "start": start,
+            "ts_ms": entry["start_timestamp"],
+            "hour": start.hour,
+            "price": price,
+        })
     out.sort(key=lambda h: h["start"])
     return out
 
@@ -70,7 +107,10 @@ def classify(price, all_prices):
     return "medium"
 
 
-def render_svg_bars(hours, current_hour, reference_price=None, reference_label=""):
+def render_svg_bars(hours, current_ts_ms, reference_price=None, reference_label=""):
+    """Server-side initial render (first paint / no-JS fallback). The
+    client-side JS rebuilds this same chart on an ongoing basis using
+    identical layout math, from a wider embedded buffer."""
     prices = [h["price"] for h in hours]
     pmin, pmax = min(prices), max(prices)
     pad = (pmax - pmin) * 0.1 or 1
@@ -84,8 +124,8 @@ def render_svg_bars(hours, current_hour, reference_price=None, reference_label="
     gap = 8
     bars_w = len(hours) * (bar_w + gap)
 
-    left_margin = 40   # room for the Y-axis line + min/max labels
-    right_margin = 90  # room for the reference line's label to extend past the bars
+    left_margin = 40
+    right_margin = 90
     plot_right = left_margin + bars_w
     width = plot_right + right_margin
 
@@ -98,10 +138,9 @@ def render_svg_bars(hours, current_hour, reference_price=None, reference_label="
         x = left_margin + i * (bar_w + gap)
         bar_h = max(2, chart_h - y_of(h["price"]))
         y = chart_h - bar_h
-        fill = "#111111" if h["hour"] == current_hour else "#c9c9c9"
+        fill = "#111111" if h["ts_ms"] == current_ts_ms else "#c9c9c9"
         bars_svg.append(
-            f'<rect data-hour="{h["hour"]}" x="{x}" y="{y}" width="{bar_w}" '
-            f'height="{bar_h}" fill="{fill}"></rect>'
+            f'<rect x="{x}" y="{y}" width="{bar_w}" height="{bar_h}" fill="{fill}"></rect>'
         )
 
     baseline = f'<line x1="{left_margin}" y1="{chart_h}" x2="{plot_right}" y2="{chart_h}" stroke="#111" stroke-width="2"></line>'
@@ -141,22 +180,23 @@ def render_svg_bars(hours, current_hour, reference_price=None, reference_label="
             break
 
     return (
-        f'<svg viewBox="0 0 {width} {chart_h + 24}" preserveAspectRatio="xMidYMid meet" '
-        f'role="img" aria-label="Hourly price bar chart, current hour highlighted live, '
+        f'<svg id="pricechart" viewBox="0 0 {width} {chart_h + 24}" preserveAspectRatio="xMidYMid meet" '
+        f'role="img" aria-label="Hourly OPTIMA Voll Aktiv gross price, current hour highlighted live, '
         f'with Y-axis, OPTIMA Aktiv reference line and visible min/max">'
         + "".join(bars_svg) + baseline + axis_line + reference_line + day_divider + minmax_labels + labels + "</svg>"
     )
 
 
-def render_html(chart_hours, today_hours, week_hours, now, diagnostics):
+def render_html(chart_hours, today_hours, week_hours, now, all_hours_wide, diagnostics):
     chart_prices = [h["price"] for h in chart_hours]
-    tiers = {h["hour"]: classify(h["price"], chart_prices) for h in chart_hours}
+    current_entry = min(chart_hours, key=lambda h: abs(h["ts_ms"] - int(now.timestamp() * 1000)))
+    tier = classify(current_entry["price"], chart_prices)
 
     day_prices = [h["price"] for h in today_hours]
     today_avg = sum(day_prices) / len(day_prices)
 
     chart = render_svg_bars(
-        chart_hours, now.hour,
+        chart_hours, current_entry["ts_ms"],
         reference_price=OPTIMA_AKTIV_CT_PER_KWH,
         reference_label="OPTIMA Aktiv",
     )
@@ -177,9 +217,11 @@ def render_html(chart_hours, today_hours, week_hours, now, diagnostics):
     else:
         avg_line = f"Today's Avg. = {today_avg:.1f} ct/kWh"
 
-    hours_json = json.dumps([
-        {"hour": h["hour"], "price": round(h["price"], 2), "tier": tiers[h["hour"]]}
-        for h in chart_hours
+    # The WIDE buffer (up to ~72h), for the client-side JS to re-slice from,
+    # using absolute timestamps (not hour-of-day, which repeats across days).
+    all_hours_json = json.dumps([
+        {"ts": h["ts_ms"], "price": round(h["price"], 3)}
+        for h in all_hours_wide
     ])
 
     css = (
@@ -203,26 +245,98 @@ def render_html(chart_hours, today_hours, week_hours, now, diagnostics):
         ".bottom{border-top:2px solid #111;padding-top:6px;font-size:2.4vmin;flex:0 0 auto;}"
     )
 
+    # Client-side rolling-window engine. Mirrors render_svg_bars' layout
+    # math exactly so the JS-rebuilt chart matches the server-rendered one.
     js = (
-        "function viennaParts(){"
-        "const f=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Vienna',"
-        "hour:'2-digit',minute:'2-digit',hour12:false});"
-        "const parts=f.formatToParts(new Date());"
-        "const get=t=>parts.find(p=>p.type===t).value;"
-        "return {hour:parseInt(get('hour')),minute:get('minute'),hourStr:get('hour')};}"
-        "const HOURS=" + hours_json + ";"
+        "var ALL_HOURS=" + all_hours_json + ";"
+        "var OPTIMA_PRICE=" + repr(OPTIMA_AKTIV_CT_PER_KWH) + ";"
+        "var WIN_PAST=" + str(WINDOW_HOURS_PAST) + ",WIN_FUT=" + str(WINDOW_HOURS_FUTURE) + ";"
+        "function viennaParts(ms){"
+        "var f=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Vienna',"
+        "year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});"
+        "var parts=f.formatToParts(new Date(ms));"
+        "var g=function(t){return parts.find(function(p){return p.type===t;}).value;};"
+        "return {hour:parseInt(g('hour')),minute:g('minute'),dateKey:g('year')+'-'+g('month')+'-'+g('day')};"
+        "}"
+        "function classify(price, allPrices){"
+        "var sorted=allPrices.slice().sort(function(a,b){return a-b;});"
+        "var n=sorted.length;"
+        "var p33=sorted[Math.floor(n*0.33)];"
+        "var p66=sorted[Math.floor(n*0.66)];"
+        "if(price<=p33)return 'low';"
+        "if(price>=p66)return 'high';"
+        "return 'medium';"
+        "}"
+        "function buildChartSVG(hours, currentTs, refPrice, refLabel){"
+        "var prices=hours.map(function(h){return h.price;});"
+        "var pmin=Math.min.apply(null,prices), pmax=Math.max.apply(null,prices);"
+        "var pad=(pmax-pmin)*0.1 || 1;"
+        "var lo=pmin-pad, hi=pmax+pad;"
+        "if(refPrice!==null){lo=Math.min(lo,refPrice-pad);hi=Math.max(hi,refPrice+pad);}"
+        "var chartH=140,barW=22,gap=8;"
+        "var barsW=hours.length*(barW+gap);"
+        "var leftM=40,rightM=90;"
+        "var plotRight=leftM+barsW;"
+        "var width=plotRight+rightM;"
+        "function yOf(p){var norm=(hi>lo)?(p-lo)/(hi-lo):0.5;return chartH-norm*chartH;}"
+        "var bars='';"
+        "for(var i=0;i<hours.length;i++){"
+        "var h=hours[i];"
+        "var x=leftM+i*(barW+gap);"
+        "var barH=Math.max(2,chartH-yOf(h.price));"
+        "var y=chartH-barH;"
+        "var fill=(h.ts===currentTs)?'#111111':'#c9c9c9';"
+        "bars+='<rect x=\"'+x+'\" y=\"'+y+'\" width=\"'+barW+'\" height=\"'+barH+'\" fill=\"'+fill+'\"></rect>';"
+        "}"
+        "var baseline='<line x1=\"'+leftM+'\" y1=\"'+chartH+'\" x2=\"'+plotRight+'\" y2=\"'+chartH+'\" stroke=\"#111\" stroke-width=\"2\"></line>';"
+        "var axisLine='<line x1=\"'+leftM+'\" y1=\"0\" x2=\"'+leftM+'\" y2=\"'+chartH+'\" stroke=\"#111\" stroke-width=\"2\"></line>';"
+        "var refLine='';"
+        "if(refPrice!==null){"
+        "var yRef=yOf(refPrice);"
+        "refLine='<line x1=\"'+leftM+'\" y1=\"'+yRef+'\" x2=\"'+width+'\" y2=\"'+yRef+'\" stroke=\"#111\" stroke-width=\"1.5\" stroke-dasharray=\"5,4\"></line>'"
+        "+'<text x=\"'+(width-2)+'\" y=\"'+(yRef-5)+'\" font-size=\"11\" fill=\"#555\" text-anchor=\"end\">'+refLabel+'</text>';"
+        "}"
+        "var yMax=yOf(pmax), yMin=yOf(pmin);"
+        "var minmax='<text x=\"'+(leftM-6)+'\" y=\"'+(yMax+4)+'\" font-size=\"11\" fill=\"#555\" text-anchor=\"end\">'+pmax.toFixed(1)+' ct</text>'"
+        "+'<text x=\"'+(leftM-6)+'\" y=\"'+(yMin+4)+'\" font-size=\"11\" fill=\"#555\" text-anchor=\"end\">'+pmin.toFixed(1)+' ct</text>';"
+        "var labels='';"
+        "var dayDivider='';"
+        "var prevDateKey=null;"
+        "for(var i=0;i<hours.length;i++){"
+        "var vp=viennaParts(hours[i].ts);"
+        "if(vp.hour%2===0){"
+        "var x=leftM+i*(barW+gap);"
+        "labels+='<text x=\"'+(x+2)+'\" y=\"'+(chartH+16)+'\" font-size=\"9\" fill=\"#555\">'+(vp.hour<10?'0':'')+vp.hour+'h</text>';"
+        "}"
+        "if(prevDateKey!==null && vp.dateKey!==prevDateKey && dayDivider===''){"
+        "var xDiv=leftM+i*(barW+gap)-gap/2;"
+        "dayDivider='<line x1=\"'+xDiv+'\" y1=\"0\" x2=\"'+xDiv+'\" y2=\"'+chartH+'\" stroke=\"#999\" stroke-width=\"1\" stroke-dasharray=\"2,2\"></line>';"
+        "}"
+        "prevDateKey=vp.dateKey;"
+        "}"
+        "return '<svg id=\"pricechart\" viewBox=\"0 0 '+width+' '+(chartH+24)+'\" preserveAspectRatio=\"xMidYMid meet\" role=\"img\" aria-label=\"Live-updating price chart\">'"
+        "+bars+baseline+axisLine+refLine+dayDivider+minmax+labels+'</svg>';"
+        "}"
         "function update(){"
-        "const v=viennaParts();"
-        "let entry=HOURS.find(h=>h.hour===v.hour);"
-        "if(!entry){entry=HOURS[HOURS.length-1];}"
-        "document.getElementById('cprice').textContent=entry.price.toFixed(1);"
-        "const tag=document.getElementById('ctag');"
-        "tag.textContent=entry.tier;"
-        "tag.className='tag '+entry.tier;"
-        "document.querySelectorAll('[data-hour]').forEach(function(el){"
-        "el.setAttribute('fill', parseInt(el.getAttribute('data-hour'))===v.hour ? '#111111' : '#c9c9c9');"
-        "});"
-        "document.getElementById('nowtime').textContent=v.hourStr+':'+v.minute;"
+        "var nowMs=Date.now();"
+        "var hourMs=3600000;"
+        "var currentHourStart=Math.floor(nowMs/hourMs)*hourMs;"
+        "var winStart=currentHourStart-WIN_PAST*hourMs;"
+        "var winEnd=currentHourStart+WIN_FUT*hourMs;"
+        "var visible=ALL_HOURS.filter(function(h){return h.ts>=winStart && h.ts<=winEnd;});"
+        "if(visible.length===0)return;"
+        "var current=visible.reduce(function(best,h){"
+        "return Math.abs(h.ts-currentHourStart)<Math.abs(best.ts-currentHourStart)?h:best;"
+        "},visible[0]);"
+        "var prices=visible.map(function(h){return h.price;});"
+        "var tier=classify(current.price,prices);"
+        "document.getElementById('cprice').textContent=current.price.toFixed(1);"
+        "var tag=document.getElementById('ctag');"
+        "tag.textContent=tier;"
+        "tag.className='tag '+tier;"
+        "document.getElementById('chartwrap').innerHTML=buildChartSVG(visible,current.ts,OPTIMA_PRICE,'OPTIMA Aktiv');"
+        "var vp=viennaParts(nowMs);"
+        "document.getElementById('nowtime').textContent=(vp.hour<10?'0':'')+vp.hour+':'+vp.minute;"
         "}"
         "update();setInterval(update,60000);"
     )
@@ -253,11 +367,11 @@ def render_html(chart_hours, today_hours, week_hours, now, diagnostics):
     lines.append("<div class='optima'>" + optima_line + "</div>")
     lines.append("<div class='row pricerow'>")
     lines.append("<div>")
-    lines.append("<div class='price'><span id='cprice'>--</span><span class='unit'> ct/kWh</span></div>")
+    lines.append("<div class='price'><span id='cprice'>" + f"{current_entry['price']:.1f}" + "</span><span class='unit'> ct/kWh</span></div>")
     lines.append("</div>")
-    lines.append("<div class='tag' id='ctag'>--</div>")
+    lines.append("<div class='tag " + tier + "' id='ctag'>" + tier + "</div>")
     lines.append("</div>")
-    lines.append("<div class='chart'>" + chart + "</div>")
+    lines.append("<div class='chart' id='chartwrap'>" + chart + "</div>")
     lines.append("<div class='row bottom'>")
     lines.append("<span>" + avg_line + "</span>")
     lines.append("</div>")
@@ -279,11 +393,6 @@ def main():
 
     diagnostics = [f"script run at (Vienna time) = {now.isoformat()}"]
 
-    # Wide fetch: yesterday through day-after-tomorrow. This comfortably
-    # covers any possible rolling window (13h back / 10h forward from any
-    # current hour never needs more than 1 day of slack either direction).
-    # aWattar simply won't have tomorrow's data yet before ~14:00 - that's
-    # fine, we just get fewer entries and the window is narrower until then.
     diagnostics.append(
         f"wide fetch requested: {midnight_yesterday.isoformat()} to {midnight_day_after_tomorrow.isoformat()}"
     )
@@ -295,20 +404,14 @@ def main():
             f"first={all_hours[0]['start'].isoformat()}, last={all_hours[-1]['start'].isoformat()}"
         )
 
-    # The rolling chart window: 14 hours before the current hour, the
-    # current hour itself, and 9 hours after = 24 slots when fully available.
-    # This split keeps a full hour of buffer past aWattar's ~14:00-14:10
-    # publish time before the window first needs tomorrow's data (at 15:00).
-    window_start = current_hour_dt - timedelta(hours=14)
-    window_end = current_hour_dt + timedelta(hours=9)
+    window_start = current_hour_dt - timedelta(hours=WINDOW_HOURS_PAST)
+    window_end = current_hour_dt + timedelta(hours=WINDOW_HOURS_FUTURE)
     chart_hours = [h for h in all_hours if window_start <= h["start"] <= window_end]
     diagnostics.append(
-        f"chart window: {window_start.isoformat()} to {window_end.isoformat()} "
-        f"-> {len(chart_hours)} bars"
+        f"initial chart window: {window_start.isoformat()} to {window_end.isoformat()} "
+        f"-> {len(chart_hours)} bars (client JS re-slices this live from the wide buffer)"
     )
 
-    # Today's Avg / 7-Day Rolling Avg stay anchored to the calendar day,
-    # independent of whatever's currently scrolled into the chart.
     today_hours = [h for h in all_hours if h["start"].date() == now.date()]
 
     diagnostics.append(f"week fetch requested: {midnight_7d_ago.isoformat()} to {midnight_today.isoformat()}")
@@ -318,7 +421,7 @@ def main():
     if not chart_hours or not today_hours:
         raise RuntimeError("No price data found from aWattar for the chart window or today.")
 
-    html = render_html(chart_hours, today_hours, week_hours, now, diagnostics)
+    html = render_html(chart_hours, today_hours, week_hours, now, all_hours, diagnostics)
 
     import os
     os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
